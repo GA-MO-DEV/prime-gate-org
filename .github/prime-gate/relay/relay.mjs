@@ -12,8 +12,9 @@ const equal = (a, b) => a.length === b.length && timingSafeEqual(a, b);
  * rota: LINE userIds allowed to ack, in wake-up order. serverToken: bearer the gate server sends.
  * The relay signs every incident record with its own Ed25519 key, so the server trusts the record, not the transport.
  */
-export function createRelay({ channelSecret, rota, serverToken, now = () => Date.now() }) {
+export function createRelay({ channelSecret, sentrySecret, rota, serverToken, now = () => Date.now() }) {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const alerts = new Set();
   const acks = new Map();
   const incidents = new Map();
 
@@ -22,6 +23,7 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
     const ack = /^รับ\s+(\S+)$/.exec(text);
     if (ack) {
       if (!ALERT.test(ack[1])) return "ignored: bad alert id";
+      if (!alerts.has(ack[1])) return "ignored: no such alert from Sentry";
       if (!acks.has(ack[1])) acks.set(ack[1], { alertId: ack[1], ackedBy: userId, ackedAt: now() });
       return "acked";
     }
@@ -42,6 +44,21 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
       return "closed";
     }
     return "ignored: unknown command";
+  }
+
+  /** Sentry webhook: Sentry-Hook-Signature is hex HMAC-SHA256 of the raw body with the integration's client secret. */
+  function sentryWebhook(raw, signature) {
+    const expected = createHmac("sha256", sentrySecret).update(raw).digest();
+    if (!/^[0-9a-f]{64}$/.test(signature ?? "") || !equal(expected, Buffer.from(signature, "hex"))) return { status: 401, body: "bad signature" };
+    let id;
+    try {
+      id = String(JSON.parse(raw.toString("utf8"))?.data?.issue?.id ?? "");
+    } catch {
+      return { status: 400, body: "bad json" };
+    }
+    if (!ALERT.test(id)) return { status: 400, body: "no issue id" };
+    alerts.add(id);
+    return { status: 200, body: JSON.stringify(["registered"]) };
   }
 
   /** LINE webhook: X-Line-Signature is base64 HMAC-SHA256 of the raw body with the channel secret. */
@@ -67,9 +84,15 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
     return { status: 200, body: JSON.stringify(results) };
   }
 
-  function getIncident(id, auth) {
+  function getIncident(encodedId, auth) {
     const expected = Buffer.from(`Bearer ${serverToken}`);
     if (!equal(expected, Buffer.from(auth ?? ""))) return { status: 401, body: "unauthorized" };
+    let id;
+    try {
+      id = decodeURIComponent(encodedId);
+    } catch {
+      return { status: 400, body: "bad incident id" };
+    }
     const record = incidents.get(id);
     if (!record) return { status: 404, body: "no such incident" };
     const payload = JSON.stringify(record);
@@ -85,16 +108,26 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
       else chunks.push(c);
     });
     req.on("end", () => {
+      try {
+        respond();
+      } catch {
+        res.writeHead(500).end("error");
+      }
+    });
+    const respond = () => {
       const url = new URL(req.url ?? "/", "http://relay");
       const m = /^\/incidents\/([^/]+)$/.exec(url.pathname);
+      const body = Buffer.concat(chunks);
       const r =
         req.method === "POST" && url.pathname === "/line/webhook"
-          ? lineWebhook(Buffer.concat(chunks), req.headers["x-line-signature"])
-          : req.method === "GET" && m
-            ? getIncident(decodeURIComponent(m[1]), req.headers.authorization)
-            : { status: 404, body: "not found" };
+          ? lineWebhook(body, req.headers["x-line-signature"])
+          : req.method === "POST" && url.pathname === "/sentry/webhook"
+            ? sentryWebhook(body, req.headers["sentry-hook-signature"])
+            : req.method === "GET" && m
+              ? getIncident(m[1], req.headers.authorization)
+              : { status: 404, body: "not found" };
       res.writeHead(r.status, { "content-type": "application/json" }).end(r.body);
-    });
+    };
   });
 
   return { server, publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) };

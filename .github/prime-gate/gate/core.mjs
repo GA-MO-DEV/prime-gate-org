@@ -68,14 +68,41 @@ export function parseSliceRef(ref) {
 /**
  * Which head may enter which base, and the check name the verdict is published under. Each base class has its own
  * check name, so a green result computed for one base never satisfies the ruleset of another after a retarget.
+ * main takes no PRs at all: go-live fast-forwards it from the App after evaluateGoLive passes (§5 GitHub ข้อ 9).
  */
 export function route({ baseRef, headRef, headRepo, repo }) {
-  const mode = baseRef.startsWith("hotfix/") ? "hotfix" : baseRef === "main" || baseRef.startsWith("release/r-") ? "release" : "develop";
+  const fail = (mode, check, error) => ({ mode, check, error });
+  if (baseRef === "main") return fail("main", null, "main ไม่รับ PR · go-live ของ App fast-forward main หลังตรวจฐาน");
+  const mode = baseRef.startsWith("hotfix/") ? "hotfix" : baseRef.startsWith("release/r-") ? "release" : "develop";
   const check = { develop: "prime-gate", release: "prime-gate-release", hotfix: "prime-gate-hotfix" }[mode];
-  if (headRepo !== repo) return { mode, check, error: `PR จาก fork (${headRepo}) ไม่รับ` };
-  if (baseRef === "main" && !/^(release\/r-[\w.-]+|hotfix\/[\w.-]+)$/.test(headRef)) return { mode, check, error: `main รับเฉพาะ release/r-* หรือ hotfix/* ไม่ใช่ ${headRef}` };
-  if (baseRef.startsWith("release/r-") && headRef !== "develop") return { mode, check, error: `${baseRef} รับเฉพาะ develop ไม่ใช่ ${headRef}` };
+  if (headRepo !== repo) return fail(mode, check, `PR จาก fork (${headRepo}) ไม่รับ`);
+  if (headRef === "main" && mode !== "hotfix") return { mode: "back-merge", check, error: null };
+  if (mode === "release" && headRef !== "develop") return fail(mode, check, `${baseRef} รับเฉพาะ develop หรือ main (back-merge) ไม่ใช่ ${headRef}`);
+  if (mode === "develop" && !parseSliceRef(headRef)) return fail(mode, check, `develop รับเฉพาะ agent/<feature>/S-<nn> หรือ main (back-merge) ใน prototype นี้ ไม่ใช่ ${headRef}`);
   return { mode, check, error: null };
+}
+
+/** Each reviewer's latest decisive review (COMMENTED never changes approval state, as on GitHub). */
+export function currentApprovers(reviews, headSha, author) {
+  const latest = new Map();
+  for (const r of reviews) if (r.state !== "COMMENTED" && r.state !== "PENDING") latest.set(r.login, r);
+  return new Set([...latest.values()].filter((r) => r.state === "APPROVED" && r.commit_id === headSha && r.login !== author).map((r) => r.login));
+}
+
+const LOCKED = /^tests\/locked\//;
+const touched = (files) => new Set(files.flatMap((x) => [x.filename, x.previous_filename].filter(Boolean)));
+
+/**
+ * Locked tests outside hotfix (§1J table): someone other than the author approves at the head SHA, and the author or
+ * that approver is in qa.
+ */
+export function evaluateLocked({ files, reviews, author, headSha, teams }) {
+  const paths = [...touched(files)].filter((p) => LOCKED.test(p));
+  if (paths.length === 0) return [];
+  const qa = teams.get("qa") ?? [];
+  const approvers = [...currentApprovers(reviews, headSha, author)];
+  if (approvers.length > 0 && (qa.includes(author) || approvers.some((l) => qa.includes(l)))) return [];
+  return [`${paths.join(", ")}: test ล็อกต้องมีคนอื่นอนุมัติที่ head SHA และ author หรือคนอนุมัติอยู่ใน qa`];
 }
 
 /**
@@ -132,19 +159,24 @@ export function parseCodeowners(text) {
     });
 }
 
-function globToRegex(pattern) {
-  const anchored = pattern.startsWith("/");
-  let p = anchored ? pattern.slice(1) : pattern;
-  const dir = p.endsWith("/");
-  if (dir) p = p.slice(0, -1);
-  const body = p
-    .split("")
-    .map((c, i, all) => {
-      if (c === "*") return all[i + 1] === "*" ? "" : all[i - 1] === "*" ? ".*" : "[^/]*";
-      return /[.+?^${}()|[\]\\]/.test(c) ? `\\${c}` : c;
-    })
-    .join("");
-  return new RegExp(`${anchored || p.includes("/") ? "^" : "(^|/)"}${body}${dir ? "/" : "(/|$)"}`);
+/** CODEOWNERS glob → RegExp, per GitHub's CODEOWNERS rules (a trailing `/*` matches only direct children). */
+export function globToRegex(pattern) {
+  let p = pattern;
+  const anchored = p.startsWith("/") || p.slice(0, -1).includes("/");
+  p = p.replace(/^\//, "");
+  const dirOnly = p.endsWith("/");
+  p = p.replace(/\/$/, "");
+  const segs = p.split("/");
+  const seg = (x) => x.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\?/g, "[^/]").replace(/\*/g, "[^/]*");
+  let body = "";
+  segs.forEach((x, i) => {
+    const last = i === segs.length - 1;
+    if (x === "**") body += last ? ".*" : "(?:.*/)?";
+    else body += seg(x) + (last ? "" : "/");
+  });
+  const lastSeg = segs[segs.length - 1];
+  const tail = dirOnly ? "/" : lastSeg === "**" ? "" : /\*/.test(lastSeg) ? "$" : "(/|$)";
+  return new RegExp(`${anchored ? "^" : "(^|/)"}${body}${tail}`);
 }
 
 export function ownersOf(rules, path) {
@@ -153,18 +185,35 @@ export function ownersOf(rules, path) {
   return owners;
 }
 
-const LOCKED = /^tests\/locked\//;
 const ENGINEERING = ["dev", "oncall", "domain"];
 const CONTROL = [/^\.github\//, /^CODEOWNERS$/, /^docs\/CODEOWNERS$/, /^db\/migrations\//, /^tier-rules\.yml$/];
+
+/**
+ * Base facts, shared by the hotfix gate and go-live: main HEAD carries an r-* tag, main HEAD is an ancestor of what will
+ * land, and no commit between them is develop code or arrived outside a PR into this branch.
+ */
+export function baseProblems(base) {
+  const problems = [];
+  if (!base.mainTag) problems.push("main HEAD ไม่มี tag r-* จึงไม่รู้ว่า production คือ release ไหน");
+  if (!base.mainIsAncestor) problems.push("ไม่ได้แตกจาก main HEAD (fast-forward main ไม่ได้)");
+  if (base.foreign.length > 0) problems.push(`มี commit ที่เป็นโค้ดของ develop หรือไม่ได้มาจาก PR เข้า branch นี้: ${base.foreign.map((s) => s.slice(0, 7)).join(", ")}`);
+  return problems;
+}
+
+/** Go-live check the App runs right before fast-forwarding main to a hotfix or release branch. */
+export function evaluateGoLive(branch, base) {
+  const problems = baseProblems(base);
+  return { ok: problems.length === 0, title: problems.length === 0 ? `fast-forward main → ${branch} ได้` : `ห้าม fast-forward main → ${branch}`, lines: problems.map((p) => `✗ ${p}`) };
+}
 
 /**
  * Hotfix mode of the gate (process §8 H4, the four 2b items).
  * facts: {
  *   author, headSha, incidentId,
  *   incident: { ok, why },                         // relay-signed incident record, verified by the caller
- *   base: { mainTag, mainIsAncestor, foreign: [sha] }, // r-* tag at main HEAD, main reachable from the hotfix branch, commits not from hotfix PRs
+ *   base: { mainTag, mainIsAncestor, foreign: [sha] }, // see baseProblems
+ *   codeowners: string | null,                     // first CODEOWNERS GitHub would use, at the base tip
  *   files: [{ filename, previous_filename? }],
- *   codeowners: string,                            // CODEOWNERS at the base SHA
  *   reviews: [{ login, state, commit_id }],
  *   teams: Map<team, logins[]>,                    // team.md from the hub
  *   org: "GA-MO-DEV",
@@ -174,23 +223,19 @@ export function evaluateHotfix(f) {
   const problems = [];
   const notes = [];
   if (!f.incident.ok) problems.push(`incident ${f.incidentId}: ${f.incident.why}`);
-  if (!f.base.mainTag) problems.push("main HEAD ไม่มี tag r-* จึงไม่รู้ว่า production คือ release ไหน");
-  if (!f.base.mainIsAncestor) problems.push("branch hotfix ไม่ได้แตกจาก main HEAD (fast-forward main ไม่ได้)");
-  if (f.base.foreign.length > 0) problems.push(`branch มี commit ที่ไม่ได้มาจาก PR เข้า branch นี้: ${f.base.foreign.map((s) => s.slice(0, 7)).join(", ")}`);
+  problems.push(...baseProblems(f.base));
 
   const inTeam = (team, login) => (f.teams.get(team) ?? []).includes(login);
   const engineer = (login) => ENGINEERING.some((t) => inTeam(t, login));
-  const approvers = new Set(
-    f.reviews.filter((r) => r.state === "APPROVED" && r.commit_id === f.headSha && r.login !== f.author && engineer(r.login)).map((r) => r.login),
-  );
+  const approvers = new Set([...currentApprovers(f.reviews, f.headSha, f.author)].filter(engineer));
   if (approvers.size === 0) problems.push(`ต้องมี engineer คนที่สอง (สมาชิก ${ENGINEERING.join("/")} ใน team.md) อนุมัติที่ head SHA · คนเปิด PR ไม่นับ`);
 
-  const rules = parseCodeowners(f.codeowners);
+  if (f.codeowners === null) problems.push("ไม่พบ CODEOWNERS (.github/, ราก หรือ docs/) ที่ฐาน จึงตัดสิน code owner ไม่ได้");
+  const rules = parseCodeowners(f.codeowners ?? "");
   const teamOf = (owner) => owner.replace(new RegExp(`^@${f.org}/`, "i"), "");
   const oncall = [...approvers].filter((l) => inTeam("oncall", l));
 
-  const paths = new Set(f.files.flatMap((x) => [x.filename, x.previous_filename].filter(Boolean)));
-  for (const path of paths) {
+  for (const path of touched(f.files)) {
     if (LOCKED.test(path)) {
       problems.push(`${path}: hotfix แก้ test ล็อกไม่ได้ (§17 ข้อ 63) ไปทาง flow ปกติ`);
       continue;
