@@ -1,0 +1,1 @@
+high: [src/money/**, db/migrations/**]

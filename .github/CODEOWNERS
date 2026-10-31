@@ -1,0 +1,5 @@
+/db/migrations/ @GA-MO-DEV/domain
+/src/money/ @GA-MO-DEV/domain
+/.github/ @GA-MO-DEV/domain
+/tier-rules.yml @GA-MO-DEV/domain
+/package.json @GA-MO-DEV/domain

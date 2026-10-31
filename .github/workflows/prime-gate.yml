@@ -1,0 +1,22 @@
+name: prime-gate
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  prime-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Default branch only. Never checks out or runs PR code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/prime-gate
+          persist-credentials: false
+      - run: node .github/prime-gate/gate/run.mjs "$REPO" "$PR"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
