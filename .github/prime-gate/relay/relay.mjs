@@ -5,6 +5,10 @@ import { createServer } from "node:http";
 const ALERT = /^[A-Za-z0-9-]{1,64}$/;
 const INCIDENT = /^\d{4}-\d{2}-\d{2}-[a-z0-9]+(-[a-z0-9]+)*$/;
 const MAX_BODY = 64 * 1024;
+const ALERT_TTL = 24 * 3600 * 1000;
+// Issue alerts (resource event_alert) send "triggered" with data.event.issue_id; issue webhooks send "created" for a new
+// issue and "unresolved" when it regresses or escalates, with data.issue.id.
+const FIRING = new Set(["triggered", "created", "unresolved"]);
 
 const equal = (a, b) => a.length === b.length && timingSafeEqual(a, b);
 
@@ -12,8 +16,9 @@ const equal = (a, b) => a.length === b.length && timingSafeEqual(a, b);
  * rota: LINE userIds allowed to ack, in wake-up order. serverToken: bearer the gate server sends.
  * The relay signs every incident record with its own Ed25519 key, so the server trusts the record, not the transport.
  */
-export function createRelay({ channelSecret, rota, serverToken, now = () => Date.now() }) {
+export function createRelay({ channelSecret, sentrySecret, rota, serverToken, now = () => Date.now() }) {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const alerts = new Map();
   const acks = new Map();
   const incidents = new Map();
 
@@ -22,6 +27,7 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
     const ack = /^รับ\s+(\S+)$/.exec(text);
     if (ack) {
       if (!ALERT.test(ack[1])) return "ignored: bad alert id";
+      if (!(now() - (alerts.get(ack[1]) ?? -Infinity) < ALERT_TTL)) return "ignored: no such alert from Sentry in the last 24 hours";
       if (!acks.has(ack[1])) acks.set(ack[1], { alertId: ack[1], ackedBy: userId, ackedAt: now() });
       return "acked";
     }
@@ -42,6 +48,24 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
       return "closed";
     }
     return "ignored: unknown command";
+  }
+
+  /** Sentry webhook: Sentry-Hook-Signature is hex HMAC-SHA256 of the raw body with the integration's client secret. */
+  function sentryWebhook(raw, signature) {
+    const expected = createHmac("sha256", sentrySecret).update(raw).digest();
+    if (!/^[0-9a-f]{64}$/.test(signature ?? "") || !equal(expected, Buffer.from(signature, "hex"))) return { status: 401, body: "bad signature" };
+    let payload;
+    try {
+      payload = JSON.parse(raw.toString("utf8"));
+    } catch {
+      return { status: 400, body: "bad json" };
+    }
+    if (!FIRING.has(payload?.action)) return { status: 200, body: JSON.stringify(["ignored: not firing"]) };
+    const id = String(payload?.data?.event?.issue_id ?? payload?.data?.issue?.id ?? "");
+    if (!ALERT.test(id)) return { status: 400, body: "no issue id" };
+    for (const [old, at] of alerts) if (now() - at >= ALERT_TTL) alerts.delete(old);
+    alerts.set(id, now());
+    return { status: 200, body: JSON.stringify(["registered"]) };
   }
 
   /** LINE webhook: X-Line-Signature is base64 HMAC-SHA256 of the raw body with the channel secret. */
@@ -67,9 +91,15 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
     return { status: 200, body: JSON.stringify(results) };
   }
 
-  function getIncident(id, auth) {
+  function getIncident(encodedId, auth) {
     const expected = Buffer.from(`Bearer ${serverToken}`);
     if (!equal(expected, Buffer.from(auth ?? ""))) return { status: 401, body: "unauthorized" };
+    let id;
+    try {
+      id = decodeURIComponent(encodedId);
+    } catch {
+      return { status: 400, body: "bad incident id" };
+    }
     const record = incidents.get(id);
     if (!record) return { status: 404, body: "no such incident" };
     const payload = JSON.stringify(record);
@@ -85,16 +115,26 @@ export function createRelay({ channelSecret, rota, serverToken, now = () => Date
       else chunks.push(c);
     });
     req.on("end", () => {
+      try {
+        respond();
+      } catch {
+        res.writeHead(500).end("error");
+      }
+    });
+    const respond = () => {
       const url = new URL(req.url ?? "/", "http://relay");
       const m = /^\/incidents\/([^/]+)$/.exec(url.pathname);
+      const body = Buffer.concat(chunks);
       const r =
         req.method === "POST" && url.pathname === "/line/webhook"
-          ? lineWebhook(Buffer.concat(chunks), req.headers["x-line-signature"])
-          : req.method === "GET" && m
-            ? getIncident(decodeURIComponent(m[1]), req.headers.authorization)
-            : { status: 404, body: "not found" };
+          ? lineWebhook(body, req.headers["x-line-signature"])
+          : req.method === "POST" && url.pathname === "/sentry/webhook"
+            ? sentryWebhook(body, req.headers["sentry-hook-signature"])
+            : req.method === "GET" && m
+              ? getIncident(m[1], req.headers.authorization)
+              : { status: 404, body: "not found" };
       res.writeHead(r.status, { "content-type": "application/json" }).end(r.body);
-    });
+    };
   });
 
   return { server, publicKeyPem: publicKey.export({ type: "spki", format: "pem" }) };
