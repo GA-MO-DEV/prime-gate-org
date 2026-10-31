@@ -1,7 +1,11 @@
 // Collects facts for one PR from the GitHub API and the hub repo, evaluates them, prints the verdict, exits 1 on fail.
 // Usage: GITHUB_TOKEN=... node run.mjs <owner/repo> <pr-number>
 // Hotfix mode also needs PRIME_RELAY_URL, PRIME_RELAY_TOKEN, PRIME_RELAY_KEY (PEM); without them it fails closed.
-import { currentApprovers, engineers, evaluateAc, evaluateBackMerge, evaluateGoLive, evaluateHotfix, evaluateLocked, parseListMap, parseSliceRef, route } from "./core.mjs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { currentApprovers, engineers, evaluateAc, evaluateBackMerge, evaluateGoLive, evaluateHotfix, evaluateLocked, involvedPeople, parseListMap, parseSliceRef, route } from "./core.mjs";
 import { checkIncident } from "../relay/relay.mjs";
 
 const HUB = process.env.PRIME_HUB ?? "GA-MO-DEV/prime-hub-test";
@@ -125,25 +129,55 @@ async function hotfixFacts(repo, pr) {
   return { author: pr.user.login, headSha: pr.head.sha, incidentId, org: repo.split("/")[0], incident, base, codeowners, ...rt };
 }
 
+/**
+ * Clean merge = re-merging the two parents gives exactly the commit's tree, so nobody edited anything in it. Uses a
+ * blobless clone of the public repo (the server keeps its own clone). PRIME_GIT_DIR overrides the temp location.
+ */
+function cleanMergeChecker(repo) {
+  let dir = null;
+  const git = (...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return (sha, parents) => {
+    if (parents.length !== 2) return false;
+    if (!dir) {
+      dir = mkdtempSync(join(process.env.PRIME_GIT_DIR ?? tmpdir(), "prime-gate-"));
+      execFileSync("git", ["clone", "--quiet", "--bare", "--filter=blob:none", `https://github.com/${repo}.git`, dir], { stdio: "ignore" });
+      process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+    }
+    try {
+      return git("merge-tree", "--write-tree", parents[0], parents[1]).split("\n")[0] === git("rev-parse", `${sha}^{tree}`);
+    } catch {
+      return false;
+    }
+  };
+}
+
 async function backMergeVerdict(repo, pr) {
   const cmp = await gh(`repos/${repo}/compare/${encodeURIComponent(pr.base.ref)}...${pr.head.sha}`);
   if (cmp.total_commits > cmp.commits.length) return { ok: false, title: `back-merge: compare API ให้แค่ ${cmp.commits.length} จาก ${cmp.total_commits} commit จึงตรวจไม่ครบ`, lines: [] };
+  const isClean = cleanMergeChecker(repo);
   const commits = await Promise.all(
-    cmp.commits.map(async (c) => ({
-      sha: c.sha,
-      parents: c.parents.length,
-      onMain: await containsCommit(repo, "main", c.sha),
-      githubMerge: c.parents.length >= 2 && c.committer?.login === "web-flow" && c.commit.verification?.verified === true,
-      // The server also adds the push sender of every commit (§1J); the prototype only sees author and committer.
-      people: [c.author?.login, c.committer?.login].filter((l) => l && l !== "web-flow"),
-    })),
+    cmp.commits.map(async (c) => {
+      const parents = c.parents.map((p) => p.sha);
+      const onMain = await containsCommit(repo, "main", c.sha);
+      const fromBase = parents.length === 2 && (await containsCommit(repo, pr.base.ref, parents[1]));
+      return {
+        sha: c.sha,
+        parents: parents.length,
+        onMain,
+        clean: !onMain && fromBase && isClean(c.sha, parents),
+        // The server replaces these with the push sender of every commit (§1J): author and committer can be forged.
+        people: [c.author?.login, c.committer?.login].filter((l) => l && l !== "web-flow"),
+      };
+    }),
   );
   const rt = await reviewsAndTeams(repo, pr);
+  const involved = involvedPeople(commits, pr.user.login);
+  const independentReviews = rt.reviews.filter((r) => !involved.has(r.login));
   return evaluateBackMerge({
     commits,
     opener: pr.user.login,
     approvers: engineers(currentApprovers(rt.reviews, pr.head.sha, pr.user.login), rt.teams),
-    lockedProblems: evaluateLocked({ ...rt, author: pr.user.login, headSha: pr.head.sha }),
+    lockedProblems: evaluateLocked({ ...rt, reviews: independentReviews, author: pr.user.login, headSha: pr.head.sha }),
   });
 }
 

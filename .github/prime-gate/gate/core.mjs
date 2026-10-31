@@ -89,26 +89,28 @@ export function route({ baseRef, headRef, headRepo, repo }) {
   return { mode, check, error: null };
 }
 
-const BACKMERGE = /^backmerge\/[a-z0-9]+(?:-[a-z0-9]+)*?-(develop|r-[a-z0-9.]+)$/;
+const BACKMERGE = /^backmerge\/[a-z0-9]+(?:-[a-z0-9]+)*?-(develop|r-[A-Za-z0-9._-]+)$/;
+
+/** Everyone who opened the PR or touched a commit in it that is not on main. None of them counts as an independent approver. */
+export const involvedPeople = (commits, opener) => new Set([opener, ...commits.filter((c) => !c.onMain).flatMap((c) => c.people)]);
 
 /**
- * Back-merge: every commit the PR adds is already on main, or is a merge commit. A merge GitHub made and signed itself
- * ("Update branch", committer web-flow, verified) cannot carry conflict edits, because that button refuses conflicts.
- * Any other merge commit may, so an engineer approves it who neither opened the PR nor authored, committed or pushed
- * any commit in it.
- * facts: { commits: [{ sha, onMain, parents, githubMerge, people: [login] }], opener, approvers: Set<login> (current,
- *          engineering only), lockedProblems: [string] }
+ * Back-merge: every commit the PR adds is already on main, or is a merge commit. A merge is clean when re-merging its
+ * parents gives exactly its tree and the merged-in parent is on the base branch; nobody could have edited anything in
+ * it. Any other merge may carry conflict edits, so an engineer approves it who is not in involvedPeople. `people` must
+ * come from the server's push senders (§1J); author and committer alone can be forged.
+ * facts: { commits: [{ sha, onMain, parents, clean, people: [login] }], opener, approvers: Set<login> (current,
+ *          engineering only), lockedProblems: [string] (computed without involved people's reviews) }
  */
 export function evaluateBackMerge({ commits, opener, approvers, lockedProblems }) {
   const stray = commits.filter((c) => !c.onMain && c.parents < 2);
   if (stray.length > 0) return { ok: false, title: "back-merge มี commit ที่ไม่ได้มาจาก main", lines: stray.map((c) => `✗ ${c.sha.slice(0, 7)} ไม่อยู่บน main และไม่ใช่ merge commit`) };
   const lines = lockedProblems.map((l) => `✗ ${l}`);
-  const manual = commits.filter((c) => !c.onMain && !c.githubMerge);
-  if (manual.length > 0) {
-    const involved = new Set([opener, ...manual.flatMap((c) => c.people)]);
-    const independent = [...approvers].filter((l) => !involved.has(l));
-    if (independent.length === 0)
-      lines.push(...manual.map((c) => `✗ ${c.sha.slice(0, 7)} merge commit ที่คนทำเอง (อาจมีการแก้ conflict) ต้องมี engineer ที่ไม่ได้ทำ commit ใน PR นี้อนุมัติ`));
+  const edited = commits.filter((c) => !c.onMain && !c.clean);
+  if (edited.length > 0) {
+    const involved = involvedPeople(commits, opener);
+    if (![...approvers].some((l) => !involved.has(l)))
+      lines.push(...edited.map((c) => `✗ ${c.sha.slice(0, 7)} merge commit ที่เนื้อหาไม่ตรงกับการ merge อัตโนมัติ (มีการแก้ conflict) ต้องมี engineer ที่ไม่ได้แตะ commit ใน PR นี้อนุมัติ`));
   }
   return lines.length > 0 ? { ok: false, title: "back-merge ยังไม่ผ่าน", lines } : { ok: true, title: `back-merge จาก main ${commits.length} commit`, lines: [] };
 }
