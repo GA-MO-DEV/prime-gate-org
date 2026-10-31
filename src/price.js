@@ -6,3 +6,4 @@ export const totalBaht = (satang) => total(satang) / 100;
 
 
 export const totalSatang = (satang) => total(satang);
+export const totalRounded = (satang) => Math.round(total(satang));
