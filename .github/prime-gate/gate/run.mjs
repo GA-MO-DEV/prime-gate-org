@@ -88,7 +88,7 @@ async function baseFacts(repo, branch, { headSha = null, prCommits = new Set() }
   const compares = await Promise.all(ends.map((sha) => gh(`repos/${repo}/compare/${main.commit.sha}...${sha}`)));
   const mainIsAncestor = compares.every((c) => c.status === "ahead" || c.status === "identical");
   const foreign = [];
-  if (compares.some((c) => c.total_commits > c.commits.length)) foreign.push(`(เกิน ${Math.max(...compares.map((c) => c.total_commits))} commit ตรวจไม่ครบ)`);
+  if (compares.some((c) => c.total_commits > c.commits.length)) foreign.push(`(compare API ให้แค่ ${Math.min(...compares.map((c) => c.commits.length))} จาก ${Math.max(...compares.map((c) => c.total_commits))} commit จึงตรวจไม่ครบ)`);
   if (mainIsAncestor && foreign.length === 0) {
     const commits = new Map(compares.flatMap((c) => c.commits.map((x) => [x.sha, x])));
     for (const sha of commits.keys()) {
@@ -127,10 +127,24 @@ async function hotfixFacts(repo, pr) {
 
 async function backMergeVerdict(repo, pr) {
   const cmp = await gh(`repos/${repo}/compare/${encodeURIComponent(pr.base.ref)}...${pr.head.sha}`);
-  if (cmp.total_commits > cmp.commits.length) return { ok: false, title: `back-merge เกิน ${cmp.commits.length} commit ตรวจไม่ครบ`, lines: [] };
-  const commits = await Promise.all(cmp.commits.map(async (c) => ({ sha: c.sha, parents: c.parents.length, onMain: await containsCommit(repo, "main", c.sha) })));
+  if (cmp.total_commits > cmp.commits.length) return { ok: false, title: `back-merge: compare API ให้แค่ ${cmp.commits.length} จาก ${cmp.total_commits} commit จึงตรวจไม่ครบ`, lines: [] };
+  const commits = await Promise.all(
+    cmp.commits.map(async (c) => ({
+      sha: c.sha,
+      parents: c.parents.length,
+      onMain: await containsCommit(repo, "main", c.sha),
+      githubMerge: c.parents.length >= 2 && c.committer?.login === "web-flow" && c.commit.verification?.verified === true,
+      // The server also adds the push sender of every commit (§1J); the prototype only sees author and committer.
+      people: [c.author?.login, c.committer?.login].filter((l) => l && l !== "web-flow"),
+    })),
+  );
   const rt = await reviewsAndTeams(repo, pr);
-  return evaluateBackMerge({ commits, approvers: engineers(currentApprovers(rt.reviews, pr.head.sha, pr.user.login), rt.teams) });
+  return evaluateBackMerge({
+    commits,
+    opener: pr.user.login,
+    approvers: engineers(currentApprovers(rt.reviews, pr.head.sha, pr.user.login), rt.teams),
+    lockedProblems: evaluateLocked({ ...rt, author: pr.user.login, headSha: pr.head.sha }),
+  });
 }
 
 async function developVerdict(repo, pr) {

@@ -6,7 +6,9 @@ const ALERT = /^[A-Za-z0-9-]{1,64}$/;
 const INCIDENT = /^\d{4}-\d{2}-\d{2}-[a-z0-9]+(-[a-z0-9]+)*$/;
 const MAX_BODY = 64 * 1024;
 const ALERT_TTL = 24 * 3600 * 1000;
-const FIRING = new Set(["triggered", "created"]);
+// Issue alerts (resource event_alert) send "triggered" with data.event.issue_id; issue webhooks send "created" for a new
+// issue and "unresolved" when it regresses or escalates, with data.issue.id.
+const FIRING = new Set(["triggered", "created", "unresolved"]);
 
 const equal = (a, b) => a.length === b.length && timingSafeEqual(a, b);
 
@@ -59,8 +61,9 @@ export function createRelay({ channelSecret, sentrySecret, rota, serverToken, no
       return { status: 400, body: "bad json" };
     }
     if (!FIRING.has(payload?.action)) return { status: 200, body: JSON.stringify(["ignored: not firing"]) };
-    const id = String(payload?.data?.issue?.id ?? "");
+    const id = String(payload?.data?.event?.issue_id ?? payload?.data?.issue?.id ?? "");
     if (!ALERT.test(id)) return { status: 400, body: "no issue id" };
+    for (const [old, at] of alerts) if (now() - at >= ALERT_TTL) alerts.delete(old);
     alerts.set(id, now());
     return { status: 200, body: JSON.stringify(["registered"]) };
   }

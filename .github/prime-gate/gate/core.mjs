@@ -69,8 +69,9 @@ export function parseSliceRef(ref) {
  * Which head may enter which base, and the check name the verdict is published under. Each base class has its own
  * check name, so a green result computed for one base never satisfies the ruleset of another after a retarget.
  * main takes no PR at all: go-live fast-forwards it from the App after evaluateGoLive passes (§5 GitHub ข้อ 9).
- * Back-merges after go-live (H6) come from a `backmerge/*` branch the App cuts from main, because "update branch" and
- * conflict resolution must push to the head, and main takes no pushes.
+ * Back-merges after go-live (H6) come from `backmerge/<id>-<target>`, one branch per target that the App cuts from main,
+ * because "update branch" and conflict resolution must push to the head, main takes no pushes, and a branch updated
+ * against develop would carry develop commits into a release.
  */
 export function route({ baseRef, headRef, headRepo, repo }) {
   const fail = (mode, check, error) => ({ mode, check, error });
@@ -78,26 +79,38 @@ export function route({ baseRef, headRef, headRepo, repo }) {
   const mode = baseRef.startsWith("hotfix/") ? "hotfix" : baseRef.startsWith("release/r-") ? "release" : "develop";
   const check = { develop: "prime-gate", release: "prime-gate-release", hotfix: "prime-gate-hotfix" }[mode];
   if (headRepo !== repo) return fail(mode, check, `PR จาก fork (${headRepo}) ไม่รับ`);
-  if (BACKMERGE.test(headRef) && mode !== "hotfix") return { mode: "back-merge", check, error: null };
+  const bm = BACKMERGE.exec(headRef);
+  if (bm && mode !== "hotfix") {
+    const target = baseRef === "develop" ? "develop" : baseRef.replace(/^release\//, "");
+    return bm[1] === target ? { mode: "back-merge", check, error: null } : fail(mode, check, `${headRef} เป็น back-merge ของ ${bm[1]} ไม่ใช่ ${baseRef}`);
+  }
   if (mode === "release" && headRef !== "develop") return fail(mode, check, `${baseRef} รับเฉพาะ develop หรือ backmerge/* ไม่ใช่ ${headRef}`);
   if (mode === "develop" && !parseSliceRef(headRef)) return fail(mode, check, `develop รับเฉพาะ agent/<feature>/S-<nn> หรือ backmerge/* ใน prototype นี้ ไม่ใช่ ${headRef}`);
   return { mode, check, error: null };
 }
 
-const BACKMERGE = /^backmerge\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const BACKMERGE = /^backmerge\/[a-z0-9]+(?:-[a-z0-9]+)*?-(develop|r-[a-z0-9.]+)$/;
 
 /**
- * Back-merge: every commit the PR adds must already be on main, or be a merge commit. A merge commit that is not on main
- * may carry conflict-resolution edits, so an engineer other than the author approves it.
- * facts: { commits: [{ sha, onMain, parents }], approvers: Set<login> (current, engineering only) }
+ * Back-merge: every commit the PR adds is already on main, or is a merge commit. A merge GitHub made and signed itself
+ * ("Update branch", committer web-flow, verified) cannot carry conflict edits, because that button refuses conflicts.
+ * Any other merge commit may, so an engineer approves it who neither opened the PR nor authored, committed or pushed
+ * any commit in it.
+ * facts: { commits: [{ sha, onMain, parents, githubMerge, people: [login] }], opener, approvers: Set<login> (current,
+ *          engineering only), lockedProblems: [string] }
  */
-export function evaluateBackMerge({ commits, approvers }) {
+export function evaluateBackMerge({ commits, opener, approvers, lockedProblems }) {
   const stray = commits.filter((c) => !c.onMain && c.parents < 2);
   if (stray.length > 0) return { ok: false, title: "back-merge มี commit ที่ไม่ได้มาจาก main", lines: stray.map((c) => `✗ ${c.sha.slice(0, 7)} ไม่อยู่บน main และไม่ใช่ merge commit`) };
-  const merges = commits.filter((c) => !c.onMain);
-  if (merges.length > 0 && approvers.size === 0)
-    return { ok: false, title: "back-merge มี merge commit ใหม่ ต้องมี engineer อีกคนอนุมัติ", lines: merges.map((c) => `✗ ${c.sha.slice(0, 7)} merge commit ที่อาจมีการแก้ conflict`) };
-  return { ok: true, title: `back-merge จาก main ${commits.length} commit`, lines: [] };
+  const lines = lockedProblems.map((l) => `✗ ${l}`);
+  const manual = commits.filter((c) => !c.onMain && !c.githubMerge);
+  if (manual.length > 0) {
+    const involved = new Set([opener, ...manual.flatMap((c) => c.people)]);
+    const independent = [...approvers].filter((l) => !involved.has(l));
+    if (independent.length === 0)
+      lines.push(...manual.map((c) => `✗ ${c.sha.slice(0, 7)} merge commit ที่คนทำเอง (อาจมีการแก้ conflict) ต้องมี engineer ที่ไม่ได้ทำ commit ใน PR นี้อนุมัติ`));
+  }
+  return lines.length > 0 ? { ok: false, title: "back-merge ยังไม่ผ่าน", lines } : { ok: true, title: `back-merge จาก main ${commits.length} commit`, lines: [] };
 }
 
 export const ENGINEERING = ["dev", "oncall", "domain"];
