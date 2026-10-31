@@ -66,6 +66,82 @@ export function parseSliceRef(ref) {
 }
 
 /**
+ * Which head may enter which base, and the check name the verdict is published under. Each base class has its own
+ * check name, so a green result computed for one base never satisfies the ruleset of another after a retarget.
+ * main takes no PR at all: go-live fast-forwards it from the App after evaluateGoLive passes (§5 GitHub ข้อ 9).
+ * Back-merges after go-live (H6) come from `backmerge/<id>-<target>`, one branch per target that the App cuts from main,
+ * because "update branch" and conflict resolution must push to the head, main takes no pushes, and a branch updated
+ * against develop would carry develop commits into a release.
+ */
+export function route({ baseRef, headRef, headRepo, repo }) {
+  const fail = (mode, check, error) => ({ mode, check, error });
+  if (baseRef === "main") return fail("main", null, "main ไม่รับ PR · go-live ของ App fast-forward main หลังตรวจฐาน");
+  const mode = baseRef.startsWith("hotfix/") ? "hotfix" : baseRef.startsWith("release/r-") ? "release" : "develop";
+  const check = { develop: "prime-gate", release: "prime-gate-release", hotfix: "prime-gate-hotfix" }[mode];
+  if (headRepo !== repo) return fail(mode, check, `PR จาก fork (${headRepo}) ไม่รับ`);
+  const bm = BACKMERGE.exec(headRef);
+  if (bm && mode !== "hotfix") {
+    const target = baseRef === "develop" ? "develop" : baseRef.replace(/^release\//, "");
+    return bm[1] === target ? { mode: "back-merge", check, error: null } : fail(mode, check, `${headRef} เป็น back-merge ของ ${bm[1]} ไม่ใช่ ${baseRef}`);
+  }
+  if (mode === "release" && headRef !== "develop") return fail(mode, check, `${baseRef} รับเฉพาะ develop หรือ backmerge/* ไม่ใช่ ${headRef}`);
+  if (mode === "develop" && !parseSliceRef(headRef)) return fail(mode, check, `develop รับเฉพาะ agent/<feature>/S-<nn> หรือ backmerge/* ใน prototype นี้ ไม่ใช่ ${headRef}`);
+  return { mode, check, error: null };
+}
+
+const BACKMERGE = /^backmerge\/[a-z0-9]+(?:-[a-z0-9]+)*?-(develop|r-[A-Za-z0-9._-]+)$/;
+
+/** Everyone who opened the PR or touched a commit in it that is not on main. None of them counts as an independent approver. */
+export const involvedPeople = (commits, opener) => new Set([opener, ...commits.filter((c) => !c.onMain).flatMap((c) => c.people)]);
+
+/**
+ * Back-merge: every commit the PR adds is already on main, or is a merge commit. A merge is clean when re-merging its
+ * parents gives exactly its tree and the merged-in parent is on the base branch; nobody could have edited anything in
+ * it. Any other merge may carry conflict edits, so an engineer approves it who is not in involvedPeople. `people` must
+ * come from the server's push senders (§1J); author and committer alone can be forged.
+ * facts: { commits: [{ sha, onMain, parents, clean, people: [login] }], opener, approvers: Set<login> (current,
+ *          engineering only), lockedProblems: [string] (computed without involved people's reviews) }
+ */
+export function evaluateBackMerge({ commits, opener, approvers, lockedProblems }) {
+  const stray = commits.filter((c) => !c.onMain && c.parents < 2);
+  if (stray.length > 0) return { ok: false, title: "back-merge มี commit ที่ไม่ได้มาจาก main", lines: stray.map((c) => `✗ ${c.sha.slice(0, 7)} ไม่อยู่บน main และไม่ใช่ merge commit`) };
+  const lines = lockedProblems.map((l) => `✗ ${l}`);
+  const edited = commits.filter((c) => !c.onMain && !c.clean);
+  if (edited.length > 0) {
+    const involved = involvedPeople(commits, opener);
+    if (![...approvers].some((l) => !involved.has(l)))
+      lines.push(...edited.map((c) => `✗ ${c.sha.slice(0, 7)} merge commit ที่เนื้อหาไม่ตรงกับการ merge อัตโนมัติ (มีการแก้ conflict) ต้องมี engineer ที่ไม่ได้แตะ commit ใน PR นี้อนุมัติ`));
+  }
+  return lines.length > 0 ? { ok: false, title: "back-merge ยังไม่ผ่าน", lines } : { ok: true, title: `back-merge จาก main ${commits.length} commit`, lines: [] };
+}
+
+export const ENGINEERING = ["dev", "oncall", "domain"];
+export const engineers = (approvers, teams) => new Set([...approvers].filter((l) => ENGINEERING.some((t) => (teams.get(t) ?? []).includes(l))));
+
+/** Each reviewer's latest decisive review (COMMENTED never changes approval state, as on GitHub). */
+export function currentApprovers(reviews, headSha, author) {
+  const latest = new Map();
+  for (const r of reviews) if (r.state !== "COMMENTED" && r.state !== "PENDING") latest.set(r.login, r);
+  return new Set([...latest.values()].filter((r) => r.state === "APPROVED" && r.commit_id === headSha && r.login !== author).map((r) => r.login));
+}
+
+const LOCKED = /^tests\/locked\//;
+const touched = (files) => new Set(files.flatMap((x) => [x.filename, x.previous_filename].filter(Boolean)));
+
+/**
+ * Locked tests outside hotfix (§1J table): someone other than the author approves at the head SHA, and the author or
+ * that approver is in qa.
+ */
+export function evaluateLocked({ files, reviews, author, headSha, teams }) {
+  const paths = [...touched(files)].filter((p) => LOCKED.test(p));
+  if (paths.length === 0) return [];
+  const qa = teams.get("qa") ?? [];
+  const approvers = [...currentApprovers(reviews, headSha, author)];
+  if (approvers.length > 0 && (qa.includes(author) || approvers.some((l) => qa.includes(l)))) return [];
+  return [`${paths.join(", ")}: test ล็อกต้องมีคนอื่นอนุมัติที่ head SHA และ author หรือคนอนุมัติอยู่ใน qa`];
+}
+
+/**
  * Per-AC approval gate. An AC passes only when its text still hashes to the hash a confirmed approval named.
  * facts: { slice, planMd, specMd, approvals: [{ id, status, affects: ["AC-01@abcd1234"] }], holds: ["AC-02"] }
  */
@@ -119,19 +195,24 @@ export function parseCodeowners(text) {
     });
 }
 
-function globToRegex(pattern) {
-  const anchored = pattern.startsWith("/");
-  let p = anchored ? pattern.slice(1) : pattern;
-  const dir = p.endsWith("/");
-  if (dir) p = p.slice(0, -1);
-  const body = p
-    .split("")
-    .map((c, i, all) => {
-      if (c === "*") return all[i + 1] === "*" ? "" : all[i - 1] === "*" ? ".*" : "[^/]*";
-      return /[.+?^${}()|[\]\\]/.test(c) ? `\\${c}` : c;
-    })
-    .join("");
-  return new RegExp(`${anchored || p.includes("/") ? "^" : "(^|/)"}${body}${dir ? "/" : "(/|$)"}`);
+/** CODEOWNERS glob → RegExp, per GitHub's CODEOWNERS rules (a trailing `/*` matches only direct children). */
+export function globToRegex(pattern) {
+  let p = pattern;
+  const anchored = p.startsWith("/") || p.slice(0, -1).includes("/");
+  p = p.replace(/^\//, "");
+  const dirOnly = p.endsWith("/");
+  p = p.replace(/\/$/, "");
+  const segs = p.split("/");
+  const seg = (x) => x.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\?/g, "[^/]").replace(/\*/g, "[^/]*");
+  let body = "";
+  segs.forEach((x, i) => {
+    const last = i === segs.length - 1;
+    if (x === "**") body += last ? ".*" : "(?:.*/)?";
+    else body += seg(x) + (last ? "" : "/");
+  });
+  const lastSeg = segs[segs.length - 1];
+  const tail = dirOnly ? "/" : lastSeg === "**" ? "" : /\*/.test(lastSeg) ? "$" : "(/|$)";
+  return new RegExp(`${anchored ? "^" : "(^|/)"}${body}${tail}`);
 }
 
 export function ownersOf(rules, path) {
@@ -140,17 +221,34 @@ export function ownersOf(rules, path) {
   return owners;
 }
 
-const LOCKED = /^tests\/locked\//;
 const CONTROL = [/^\.github\//, /^CODEOWNERS$/, /^docs\/CODEOWNERS$/, /^db\/migrations\//, /^tier-rules\.yml$/];
+
+/**
+ * Base facts, shared by the hotfix gate and go-live: main HEAD carries an r-* tag, main HEAD is an ancestor of what will
+ * land, and no commit between them is develop code or arrived outside a PR into this branch.
+ */
+export function baseProblems(base) {
+  const problems = [];
+  if (!base.mainTag) problems.push("main HEAD ไม่มี tag r-* จึงไม่รู้ว่า production คือ release ไหน");
+  if (!base.mainIsAncestor) problems.push("ไม่ได้แตกจาก main HEAD (fast-forward main ไม่ได้)");
+  if (base.foreign.length > 0) problems.push(`มี commit ที่เป็นโค้ดของ develop หรือไม่ได้มาจาก PR เข้า branch นี้: ${base.foreign.map((s) => (/^[0-9a-f]{40}$/.test(s) ? s.slice(0, 7) : s)).join(", ")}`);
+  return problems;
+}
+
+/** Go-live check the App runs right before fast-forwarding main to a hotfix or release branch. */
+export function evaluateGoLive(branch, base) {
+  const problems = baseProblems(base);
+  return { ok: problems.length === 0, title: problems.length === 0 ? `fast-forward main → ${branch} ได้` : `ห้าม fast-forward main → ${branch}`, lines: problems.map((p) => `✗ ${p}`) };
+}
 
 /**
  * Hotfix mode of the gate (process §8 H4, the four 2b items).
  * facts: {
  *   author, headSha, incidentId,
  *   incident: { ok, why },                         // relay-signed incident record, verified by the caller
- *   base: { mainTag, mainIsAncestor, foreign: [sha] }, // r-* tag at main HEAD, main reachable from the hotfix branch, commits not from hotfix PRs
+ *   base: { mainTag, mainIsAncestor, foreign: [sha] }, // see baseProblems
+ *   codeowners: string | null,                     // first CODEOWNERS GitHub would use, at the base tip
  *   files: [{ filename, previous_filename? }],
- *   codeowners: string,                            // CODEOWNERS at the base SHA
  *   reviews: [{ login, state, commit_id }],
  *   teams: Map<team, logins[]>,                    // team.md from the hub
  *   org: "GA-MO-DEV",
@@ -160,22 +258,18 @@ export function evaluateHotfix(f) {
   const problems = [];
   const notes = [];
   if (!f.incident.ok) problems.push(`incident ${f.incidentId}: ${f.incident.why}`);
-  if (!f.base.mainTag) problems.push("main HEAD ไม่มี tag r-* จึงไม่รู้ว่า production คือ release ไหน");
-  if (!f.base.mainIsAncestor) problems.push("branch hotfix ไม่ได้แตกจาก main HEAD (fast-forward main ไม่ได้)");
-  if (f.base.foreign.length > 0) problems.push(`branch มี commit ที่ไม่ได้มาจาก PR เข้า branch นี้: ${f.base.foreign.map((s) => s.slice(0, 7)).join(", ")}`);
+  problems.push(...baseProblems(f.base));
 
-  const approvers = new Set(
-    f.reviews.filter((r) => r.state === "APPROVED" && r.commit_id === f.headSha && r.login !== f.author).map((r) => r.login),
-  );
-  if (approvers.size === 0) problems.push("ต้องมี engineer คนที่สองอนุมัติที่ head SHA (คนเปิด PR ไม่นับ)");
-
-  const rules = parseCodeowners(f.codeowners);
-  const teamOf = (owner) => owner.replace(new RegExp(`^@${f.org}/`, "i"), "");
   const inTeam = (team, login) => (f.teams.get(team) ?? []).includes(login);
+  const approvers = engineers(currentApprovers(f.reviews, f.headSha, f.author), f.teams);
+  if (approvers.size === 0) problems.push(`ต้องมี engineer คนที่สอง (สมาชิก ${ENGINEERING.join("/")} ใน team.md) อนุมัติที่ head SHA · คนเปิด PR ไม่นับ`);
+
+  if (f.codeowners === null) problems.push("ไม่พบ CODEOWNERS (.github/, ราก หรือ docs/) ที่ฐาน จึงตัดสิน code owner ไม่ได้");
+  const rules = parseCodeowners(f.codeowners ?? "");
+  const teamOf = (owner) => owner.replace(new RegExp(`^@${f.org}/`, "i"), "");
   const oncall = [...approvers].filter((l) => inTeam("oncall", l));
 
-  const paths = new Set(f.files.flatMap((x) => [x.filename, x.previous_filename].filter(Boolean)));
-  for (const path of paths) {
+  for (const path of touched(f.files)) {
     if (LOCKED.test(path)) {
       problems.push(`${path}: hotfix แก้ test ล็อกไม่ได้ (§17 ข้อ 63) ไปทาง flow ปกติ`);
       continue;
