@@ -68,7 +68,9 @@ export function parseSliceRef(ref) {
 /**
  * Which head may enter which base, and the check name the verdict is published under. Each base class has its own
  * check name, so a green result computed for one base never satisfies the ruleset of another after a retarget.
- * main takes no PRs at all: go-live fast-forwards it from the App after evaluateGoLive passes (§5 GitHub ข้อ 9).
+ * main takes no PR at all: go-live fast-forwards it from the App after evaluateGoLive passes (§5 GitHub ข้อ 9).
+ * Back-merges after go-live (H6) come from a `backmerge/*` branch the App cuts from main, because "update branch" and
+ * conflict resolution must push to the head, and main takes no pushes.
  */
 export function route({ baseRef, headRef, headRepo, repo }) {
   const fail = (mode, check, error) => ({ mode, check, error });
@@ -76,11 +78,30 @@ export function route({ baseRef, headRef, headRepo, repo }) {
   const mode = baseRef.startsWith("hotfix/") ? "hotfix" : baseRef.startsWith("release/r-") ? "release" : "develop";
   const check = { develop: "prime-gate", release: "prime-gate-release", hotfix: "prime-gate-hotfix" }[mode];
   if (headRepo !== repo) return fail(mode, check, `PR จาก fork (${headRepo}) ไม่รับ`);
-  if (headRef === "main" && mode !== "hotfix") return { mode: "back-merge", check, error: null };
-  if (mode === "release" && headRef !== "develop") return fail(mode, check, `${baseRef} รับเฉพาะ develop หรือ main (back-merge) ไม่ใช่ ${headRef}`);
-  if (mode === "develop" && !parseSliceRef(headRef)) return fail(mode, check, `develop รับเฉพาะ agent/<feature>/S-<nn> หรือ main (back-merge) ใน prototype นี้ ไม่ใช่ ${headRef}`);
+  if (BACKMERGE.test(headRef) && mode !== "hotfix") return { mode: "back-merge", check, error: null };
+  if (mode === "release" && headRef !== "develop") return fail(mode, check, `${baseRef} รับเฉพาะ develop หรือ backmerge/* ไม่ใช่ ${headRef}`);
+  if (mode === "develop" && !parseSliceRef(headRef)) return fail(mode, check, `develop รับเฉพาะ agent/<feature>/S-<nn> หรือ backmerge/* ใน prototype นี้ ไม่ใช่ ${headRef}`);
   return { mode, check, error: null };
 }
+
+const BACKMERGE = /^backmerge\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Back-merge: every commit the PR adds must already be on main, or be a merge commit. A merge commit that is not on main
+ * may carry conflict-resolution edits, so an engineer other than the author approves it.
+ * facts: { commits: [{ sha, onMain, parents }], approvers: Set<login> (current, engineering only) }
+ */
+export function evaluateBackMerge({ commits, approvers }) {
+  const stray = commits.filter((c) => !c.onMain && c.parents < 2);
+  if (stray.length > 0) return { ok: false, title: "back-merge มี commit ที่ไม่ได้มาจาก main", lines: stray.map((c) => `✗ ${c.sha.slice(0, 7)} ไม่อยู่บน main และไม่ใช่ merge commit`) };
+  const merges = commits.filter((c) => !c.onMain);
+  if (merges.length > 0 && approvers.size === 0)
+    return { ok: false, title: "back-merge มี merge commit ใหม่ ต้องมี engineer อีกคนอนุมัติ", lines: merges.map((c) => `✗ ${c.sha.slice(0, 7)} merge commit ที่อาจมีการแก้ conflict`) };
+  return { ok: true, title: `back-merge จาก main ${commits.length} commit`, lines: [] };
+}
+
+export const ENGINEERING = ["dev", "oncall", "domain"];
+export const engineers = (approvers, teams) => new Set([...approvers].filter((l) => ENGINEERING.some((t) => (teams.get(t) ?? []).includes(l))));
 
 /** Each reviewer's latest decisive review (COMMENTED never changes approval state, as on GitHub). */
 export function currentApprovers(reviews, headSha, author) {
@@ -185,7 +206,6 @@ export function ownersOf(rules, path) {
   return owners;
 }
 
-const ENGINEERING = ["dev", "oncall", "domain"];
 const CONTROL = [/^\.github\//, /^CODEOWNERS$/, /^docs\/CODEOWNERS$/, /^db\/migrations\//, /^tier-rules\.yml$/];
 
 /**
@@ -196,7 +216,7 @@ export function baseProblems(base) {
   const problems = [];
   if (!base.mainTag) problems.push("main HEAD ไม่มี tag r-* จึงไม่รู้ว่า production คือ release ไหน");
   if (!base.mainIsAncestor) problems.push("ไม่ได้แตกจาก main HEAD (fast-forward main ไม่ได้)");
-  if (base.foreign.length > 0) problems.push(`มี commit ที่เป็นโค้ดของ develop หรือไม่ได้มาจาก PR เข้า branch นี้: ${base.foreign.map((s) => s.slice(0, 7)).join(", ")}`);
+  if (base.foreign.length > 0) problems.push(`มี commit ที่เป็นโค้ดของ develop หรือไม่ได้มาจาก PR เข้า branch นี้: ${base.foreign.map((s) => (/^[0-9a-f]{40}$/.test(s) ? s.slice(0, 7) : s)).join(", ")}`);
   return problems;
 }
 
@@ -226,8 +246,7 @@ export function evaluateHotfix(f) {
   problems.push(...baseProblems(f.base));
 
   const inTeam = (team, login) => (f.teams.get(team) ?? []).includes(login);
-  const engineer = (login) => ENGINEERING.some((t) => inTeam(t, login));
-  const approvers = new Set([...currentApprovers(f.reviews, f.headSha, f.author)].filter(engineer));
+  const approvers = engineers(currentApprovers(f.reviews, f.headSha, f.author), f.teams);
   if (approvers.size === 0) problems.push(`ต้องมี engineer คนที่สอง (สมาชิก ${ENGINEERING.join("/")} ใน team.md) อนุมัติที่ head SHA · คนเปิด PR ไม่นับ`);
 
   if (f.codeowners === null) problems.push("ไม่พบ CODEOWNERS (.github/, ราก หรือ docs/) ที่ฐาน จึงตัดสิน code owner ไม่ได้");

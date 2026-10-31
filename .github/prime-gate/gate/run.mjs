@@ -1,7 +1,7 @@
 // Collects facts for one PR from the GitHub API and the hub repo, evaluates them, prints the verdict, exits 1 on fail.
 // Usage: GITHUB_TOKEN=... node run.mjs <owner/repo> <pr-number>
 // Hotfix mode also needs PRIME_RELAY_URL, PRIME_RELAY_TOKEN, PRIME_RELAY_KEY (PEM); without them it fails closed.
-import { evaluateAc, evaluateGoLive, evaluateHotfix, evaluateLocked, parseListMap, parseSliceRef, route } from "./core.mjs";
+import { currentApprovers, engineers, evaluateAc, evaluateBackMerge, evaluateGoLive, evaluateHotfix, evaluateLocked, parseListMap, parseSliceRef, route } from "./core.mjs";
 import { checkIncident } from "../relay/relay.mjs";
 
 const HUB = process.env.PRIME_HUB ?? "GA-MO-DEV/prime-hub-test";
@@ -88,13 +88,17 @@ async function baseFacts(repo, branch, { headSha = null, prCommits = new Set() }
   const compares = await Promise.all(ends.map((sha) => gh(`repos/${repo}/compare/${main.commit.sha}...${sha}`)));
   const mainIsAncestor = compares.every((c) => c.status === "ahead" || c.status === "identical");
   const foreign = [];
-  if (mainIsAncestor) {
+  if (compares.some((c) => c.total_commits > c.commits.length)) foreign.push(`(เกิน ${Math.max(...compares.map((c) => c.total_commits))} commit ตรวจไม่ครบ)`);
+  if (mainIsAncestor && foreign.length === 0) {
     const commits = new Map(compares.flatMap((c) => c.commits.map((x) => [x.sha, x])));
     for (const sha of commits.keys()) {
       const onDevelop = await containsCommit(repo, "develop", sha);
       const viaBranchPr = (await gh(`repos/${repo}/commits/${sha}/pulls`)).some((p) => p.merged_at && p.base.ref === branch);
       const ok = branch.startsWith("release/") ? onDevelop || viaBranchPr : !onDevelop && (viaBranchPr || prCommits.has(sha));
-      if (!ok) foreign.push(sha);
+      if (!ok) {
+        foreign.push(sha);
+        break;
+      }
     }
   }
   return { tip, base: { mainTag, mainIsAncestor, foreign } };
@@ -121,6 +125,14 @@ async function hotfixFacts(repo, pr) {
   return { author: pr.user.login, headSha: pr.head.sha, incidentId, org: repo.split("/")[0], incident, base, codeowners, ...rt };
 }
 
+async function backMergeVerdict(repo, pr) {
+  const cmp = await gh(`repos/${repo}/compare/${encodeURIComponent(pr.base.ref)}...${pr.head.sha}`);
+  if (cmp.total_commits > cmp.commits.length) return { ok: false, title: `back-merge เกิน ${cmp.commits.length} commit ตรวจไม่ครบ`, lines: [] };
+  const commits = await Promise.all(cmp.commits.map(async (c) => ({ sha: c.sha, parents: c.parents.length, onMain: await containsCommit(repo, "main", c.sha) })));
+  const rt = await reviewsAndTeams(repo, pr);
+  return evaluateBackMerge({ commits, approvers: engineers(currentApprovers(rt.reviews, pr.head.sha, pr.user.login), rt.teams) });
+}
+
 async function developVerdict(repo, pr) {
   const [ac, rt] = await Promise.all([acFacts(pr), reviewsAndTeams(repo, pr)]);
   const verdict = evaluateAc(ac);
@@ -144,14 +156,15 @@ if (arg === "--go-live") {
   if (!/^\d+$/.test(arg ?? "")) usage();
   const pr = await gh(`repos/${repo}/pulls/${arg}`);
   const r = route({ baseRef: pr.base.ref, headRef: pr.head.ref, headRepo: pr.head.repo?.full_name ?? "", repo });
-  verdict =
-    process.env.CHECK_NAME && process.env.CHECK_NAME !== r.check
+  verdict = r.error
+    ? { ok: false, title: r.error, lines: [] }
+    : process.env.CHECK_NAME && process.env.CHECK_NAME !== r.check
       ? { ok: false, title: `ผลนี้ต้องออกในชื่อ ${r.check} ไม่ใช่ ${process.env.CHECK_NAME}`, lines: [] }
-      : r.error
-        ? { ok: false, title: r.error, lines: [] }
-        : r.mode === "hotfix"
-          ? evaluateHotfix(await hotfixFacts(repo, pr))
-          : r.mode === "back-merge" || r.mode === "release"
+      : r.mode === "hotfix"
+        ? evaluateHotfix(await hotfixFacts(repo, pr))
+        : r.mode === "back-merge"
+          ? await backMergeVerdict(repo, pr)
+          : r.mode === "release"
             ? { ok: true, title: `${pr.head.ref} → ${pr.base.ref} ตามเส้นทาง`, lines: [] }
             : await developVerdict(repo, pr);
 }

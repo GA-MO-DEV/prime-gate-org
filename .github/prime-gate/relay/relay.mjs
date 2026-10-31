@@ -5,6 +5,8 @@ import { createServer } from "node:http";
 const ALERT = /^[A-Za-z0-9-]{1,64}$/;
 const INCIDENT = /^\d{4}-\d{2}-\d{2}-[a-z0-9]+(-[a-z0-9]+)*$/;
 const MAX_BODY = 64 * 1024;
+const ALERT_TTL = 24 * 3600 * 1000;
+const FIRING = new Set(["triggered", "created"]);
 
 const equal = (a, b) => a.length === b.length && timingSafeEqual(a, b);
 
@@ -14,7 +16,7 @@ const equal = (a, b) => a.length === b.length && timingSafeEqual(a, b);
  */
 export function createRelay({ channelSecret, sentrySecret, rota, serverToken, now = () => Date.now() }) {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-  const alerts = new Set();
+  const alerts = new Map();
   const acks = new Map();
   const incidents = new Map();
 
@@ -23,7 +25,7 @@ export function createRelay({ channelSecret, sentrySecret, rota, serverToken, no
     const ack = /^รับ\s+(\S+)$/.exec(text);
     if (ack) {
       if (!ALERT.test(ack[1])) return "ignored: bad alert id";
-      if (!alerts.has(ack[1])) return "ignored: no such alert from Sentry";
+      if (!(now() - (alerts.get(ack[1]) ?? -Infinity) < ALERT_TTL)) return "ignored: no such alert from Sentry in the last 24 hours";
       if (!acks.has(ack[1])) acks.set(ack[1], { alertId: ack[1], ackedBy: userId, ackedAt: now() });
       return "acked";
     }
@@ -50,14 +52,16 @@ export function createRelay({ channelSecret, sentrySecret, rota, serverToken, no
   function sentryWebhook(raw, signature) {
     const expected = createHmac("sha256", sentrySecret).update(raw).digest();
     if (!/^[0-9a-f]{64}$/.test(signature ?? "") || !equal(expected, Buffer.from(signature, "hex"))) return { status: 401, body: "bad signature" };
-    let id;
+    let payload;
     try {
-      id = String(JSON.parse(raw.toString("utf8"))?.data?.issue?.id ?? "");
+      payload = JSON.parse(raw.toString("utf8"));
     } catch {
       return { status: 400, body: "bad json" };
     }
+    if (!FIRING.has(payload?.action)) return { status: 200, body: JSON.stringify(["ignored: not firing"]) };
+    const id = String(payload?.data?.issue?.id ?? "");
     if (!ALERT.test(id)) return { status: 400, body: "no issue id" };
-    alerts.add(id);
+    alerts.set(id, now());
     return { status: 200, body: JSON.stringify(["registered"]) };
   }
 
