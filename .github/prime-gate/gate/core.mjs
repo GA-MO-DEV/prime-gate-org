@@ -66,6 +66,19 @@ export function parseSliceRef(ref) {
 }
 
 /**
+ * Which head may enter which base, and the check name the verdict is published under. Each base class has its own
+ * check name, so a green result computed for one base never satisfies the ruleset of another after a retarget.
+ */
+export function route({ baseRef, headRef, headRepo, repo }) {
+  const mode = baseRef.startsWith("hotfix/") ? "hotfix" : baseRef === "main" || baseRef.startsWith("release/r-") ? "release" : "develop";
+  const check = { develop: "prime-gate", release: "prime-gate-release", hotfix: "prime-gate-hotfix" }[mode];
+  if (headRepo !== repo) return { mode, check, error: `PR จาก fork (${headRepo}) ไม่รับ` };
+  if (baseRef === "main" && !/^(release\/r-[\w.-]+|hotfix\/[\w.-]+)$/.test(headRef)) return { mode, check, error: `main รับเฉพาะ release/r-* หรือ hotfix/* ไม่ใช่ ${headRef}` };
+  if (baseRef.startsWith("release/r-") && headRef !== "develop") return { mode, check, error: `${baseRef} รับเฉพาะ develop ไม่ใช่ ${headRef}` };
+  return { mode, check, error: null };
+}
+
+/**
  * Per-AC approval gate. An AC passes only when its text still hashes to the hash a confirmed approval named.
  * facts: { slice, planMd, specMd, approvals: [{ id, status, affects: ["AC-01@abcd1234"] }], holds: ["AC-02"] }
  */
@@ -141,6 +154,7 @@ export function ownersOf(rules, path) {
 }
 
 const LOCKED = /^tests\/locked\//;
+const ENGINEERING = ["dev", "oncall", "domain"];
 const CONTROL = [/^\.github\//, /^CODEOWNERS$/, /^docs\/CODEOWNERS$/, /^db\/migrations\//, /^tier-rules\.yml$/];
 
 /**
@@ -164,14 +178,15 @@ export function evaluateHotfix(f) {
   if (!f.base.mainIsAncestor) problems.push("branch hotfix ไม่ได้แตกจาก main HEAD (fast-forward main ไม่ได้)");
   if (f.base.foreign.length > 0) problems.push(`branch มี commit ที่ไม่ได้มาจาก PR เข้า branch นี้: ${f.base.foreign.map((s) => s.slice(0, 7)).join(", ")}`);
 
+  const inTeam = (team, login) => (f.teams.get(team) ?? []).includes(login);
+  const engineer = (login) => ENGINEERING.some((t) => inTeam(t, login));
   const approvers = new Set(
-    f.reviews.filter((r) => r.state === "APPROVED" && r.commit_id === f.headSha && r.login !== f.author).map((r) => r.login),
+    f.reviews.filter((r) => r.state === "APPROVED" && r.commit_id === f.headSha && r.login !== f.author && engineer(r.login)).map((r) => r.login),
   );
-  if (approvers.size === 0) problems.push("ต้องมี engineer คนที่สองอนุมัติที่ head SHA (คนเปิด PR ไม่นับ)");
+  if (approvers.size === 0) problems.push(`ต้องมี engineer คนที่สอง (สมาชิก ${ENGINEERING.join("/")} ใน team.md) อนุมัติที่ head SHA · คนเปิด PR ไม่นับ`);
 
   const rules = parseCodeowners(f.codeowners);
   const teamOf = (owner) => owner.replace(new RegExp(`^@${f.org}/`, "i"), "");
-  const inTeam = (team, login) => (f.teams.get(team) ?? []).includes(login);
   const oncall = [...approvers].filter((l) => inTeam("oncall", l));
 
   const paths = new Set(f.files.flatMap((x) => [x.filename, x.previous_filename].filter(Boolean)));

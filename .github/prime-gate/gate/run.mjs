@@ -1,7 +1,7 @@
 // Collects facts for one PR from the GitHub API and the hub repo, evaluates them, prints the verdict, exits 1 on fail.
 // Usage: GITHUB_TOKEN=... node run.mjs <owner/repo> <pr-number>
 // Hotfix mode also needs PRIME_RELAY_URL, PRIME_RELAY_TOKEN, PRIME_RELAY_KEY (PEM); without them it fails closed.
-import { evaluateAc, evaluateHotfix, parseListMap, parseSliceRef } from "./core.mjs";
+import { evaluateAc, evaluateHotfix, parseListMap, parseSliceRef, route } from "./core.mjs";
 import { checkIncident } from "../relay/relay.mjs";
 
 const HUB = process.env.PRIME_HUB ?? "GA-MO-DEV/prime-hub-test";
@@ -72,7 +72,8 @@ async function hotfixFacts(repo, pr) {
   const main = await gh(`repos/${repo}/branches/main`);
   const tags = await all(`repos/${repo}/tags`);
   const mainTag = tags.find((t) => /^r-/.test(t.name) && t.commit.sha === main.commit.sha)?.name ?? null;
-  const cmp = await gh(`repos/${repo}/compare/${main.commit.sha}...${pr.base.sha}`);
+  const tip = (await gh(`repos/${repo}/branches/${encodeURIComponent(pr.base.ref)}`)).commit.sha;
+  const cmp = await gh(`repos/${repo}/compare/${main.commit.sha}...${tip}`);
   const mainIsAncestor = cmp.status === "ahead" || cmp.status === "identical";
   const foreign = [];
   if (mainIsAncestor) {
@@ -85,7 +86,7 @@ async function hotfixFacts(repo, pr) {
   const [files, reviews, codeowners, teamMd] = await Promise.all([
     all(`repos/${repo}/pulls/${pr.number}/files`),
     all(`repos/${repo}/pulls/${pr.number}/reviews`),
-    file(repo, ".github/CODEOWNERS", pr.base.sha),
+    file(repo, ".github/CODEOWNERS", tip),
     file(HUB, "team.md", "main"),
   ]);
   return {
@@ -108,7 +109,17 @@ if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? "") || !/^\d+$/.test(number ?? "")) {
   process.exit(2);
 }
 const pr = await gh(`repos/${repo}/pulls/${number}`);
-const verdict = pr.base.ref.startsWith("hotfix/") ? evaluateHotfix(await hotfixFacts(repo, pr)) : evaluateAc(await acFacts(pr));
+const r = route({ baseRef: pr.base.ref, headRef: pr.head.ref, headRepo: pr.head.repo?.full_name ?? "", repo });
+const verdict =
+  process.env.CHECK_NAME && process.env.CHECK_NAME !== r.check
+    ? { ok: false, title: `ผลนี้ต้องออกในชื่อ ${r.check} ไม่ใช่ ${process.env.CHECK_NAME}`, lines: [] }
+    : r.error
+      ? { ok: false, title: r.error, lines: [] }
+      : r.mode === "hotfix"
+        ? evaluateHotfix(await hotfixFacts(repo, pr))
+        : r.mode === "release"
+          ? { ok: true, title: `${pr.head.ref} → ${pr.base.ref} ตามเส้นทาง release`, lines: [] }
+          : evaluateAc(await acFacts(pr));
 console.log(`${verdict.ok ? "PASS" : "FAIL"} ${verdict.title}`);
 for (const l of verdict.lines) console.log(l);
 if (process.env.GITHUB_STEP_SUMMARY) {
