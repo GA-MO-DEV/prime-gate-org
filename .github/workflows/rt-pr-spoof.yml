@@ -1,0 +1,7 @@
+name: rt-pr-spoof
+on: pull_request
+jobs:
+  prime-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "rt spoof (fake)"

@@ -10,3 +10,5 @@ export const totalRounded = (satang) => Math.round(total(satang));
 
 // AC-02 coupon behaviour (unapproved AC), shipped under slice S-01 (fake)
 export const applyCoupon = (satang, code) => (code === "SAVE15" ? Math.round(satang * 0.85) : satang);
+
+// rt pr-spoof payload (fake)
