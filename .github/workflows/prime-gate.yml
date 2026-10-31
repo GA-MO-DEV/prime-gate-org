@@ -6,7 +6,9 @@ permissions:
   contents: read
   pull-requests: read
 jobs:
-  prime-gate:
+  gate:
+    # One check name per base class, so a green computed for one base never satisfies another base after a retarget.
+    name: ${{ startsWith(github.base_ref, 'hotfix/') && 'prime-gate-hotfix' || startsWith(github.base_ref, 'release/r-') && 'prime-gate-release' || github.base_ref == 'main' && 'prime-gate-main' || 'prime-gate' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -20,3 +22,4 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          CHECK_NAME: ${{ startsWith(github.base_ref, 'hotfix/') && 'prime-gate-hotfix' || startsWith(github.base_ref, 'release/r-') && 'prime-gate-release' || github.base_ref == 'main' && 'prime-gate-main' || 'prime-gate' }}

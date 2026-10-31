@@ -1,1 +1,1 @@
-{ "name": "prime-gate-org", "private": true, "type": "module", "scripts": { "test": "node --test tests/" } }
+{ "name": "prime-gate-org", "private": true, "type": "module", "scripts": { "test": "node --test" } }
